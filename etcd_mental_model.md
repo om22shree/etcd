@@ -1,294 +1,650 @@
-# The Absolute Beginner's Guide to etcd: Architecture, Code, and Learning Strategy
+# The Complete etcd Mental Model: Architecture, Internals & Learning Strategy
 
-Welcome to the `etcd` repository! This document is designed to give you a complete, bottom-up mental model of `etcd`—from its high-level distributed systems concepts down to the actual Go packages, structs, and code paths. 
-
-At the end of this guide, you will find a structured, step-by-step **Fan-Out Learning Strategy** to help you master this codebase at your own pace.
+> A deep-dive guide for engineers new to the `etcd` repository. Every concept maps directly to real Go packages, structs, and code paths. All diagrams are rendered with [Mermaid](https://mermaid.js.org/).
 
 ---
 
-## 1. What is etcd? (The Core Analogy)
+## Table of Contents
 
-Imagine a bank with three branch managers. To keep things safe, each manager has a copy of the bank's master database (account balances). However, to prevent fraud:
-1. They must agree on every deposit or withdrawal before updating their ledger.
+1. [What is etcd?](#1-what-is-etcd)
+2. [Go Workspace & Module Layout](#2-go-workspace--module-layout)
+3. [The Big Picture: Write Flow](#3-the-big-picture-write-flow)
+4. [Startup & Bootstrap](#4-startup--bootstrap)
+5. [Raft: The Consensus Engine](#5-raft-the-consensus-engine)
+6. [WAL: Write-Ahead Log](#6-wal-write-ahead-log)
+7. [MVCC & the Storage Engine](#7-mvcc--the-storage-engine)
+8. [BoltDB Backend & Batching](#8-boltdb-backend--batching)
+9. [Leases](#9-leases)
+10. [Watches](#10-watches)
+11. [Compaction](#11-compaction)
+12. [Authentication & RBAC](#12-authentication--rbac)
+13. [Cluster Membership & ConfChange](#13-cluster-membership--confchange)
+14. [Corruption Detection](#14-corruption-detection)
+15. [Fan-Out Learning Strategy](#15-fan-out-learning-strategy)
+
+---
+
+## 1. What is etcd?
+
+Imagine a bank with three branch managers. To keep things safe, each manager has a copy of the bank's master ledger. To prevent fraud:
+
+1. They must **agree** on every deposit or withdrawal before updating their ledger.
 2. If one manager goes offline, the other two can still agree (majority/quorum).
-3. If a customer asks any manager for their balance, that manager must ensure they aren't giving stale information by checking with the others.
+3. If a customer asks any manager for their balance, that manager must ensure they give **current** information, not stale.
 
-**etcd is that shared, consistent ledger.** 
-- It is a **distributed, strongly consistent key-value store**.
-- It is used primarily by orchestration systems like Kubernetes to store critical cluster state (e.g., "which container is running on which node?").
-- Consistency means every read returns the most recent write, or an error. There is no "eventual consistency" here.
+**etcd is that shared, consistent ledger.**
+
+| Property                | Description                                                        |
+| ----------------------- | ------------------------------------------------------------------ |
+| **Distributed**         | Data is replicated across multiple nodes via the Raft protocol     |
+| **Strongly consistent** | Every read returns the most recent committed write, or an error    |
+| **Highly available**    | Survives the failure of `(N-1)/2` nodes in an N-node cluster       |
+| **Watch-able**          | Clients can stream real-time change notifications on any key range |
+| **Transactional**       | Multi-key Compare-and-Swap (CAS) transactions are atomic           |
+
+etcd is used primarily by **Kubernetes** to store all cluster state: which pods are scheduled where, which services exist, what secrets and config maps are present.
 
 ---
 
-## 2. The Big Picture: Architecture & Data Flow
+## 2. Go Workspace & Module Layout
 
-When a client performs a write, say `Put("foo", "bar")`, here is how it flows through `etcd`:
+The repository uses a **Go workspace** (`go.work`) to manage multiple, independently versioned Go modules. Understanding this layout is essential before reading any code.
+
+```mermaid
+graph LR
+    subgraph workspace["go.work (root)"]
+        api["api/<br/>go.etcd.io/etcd/api/v3<br/>─────────────<br/>Proto definitions<br/>mvccpb, etcdserverpb<br/>authpb, membershippb"]
+        clientpkg["client/pkg/v3<br/>go.etcd.io/etcd/client/pkg/v3<br/>─────────────<br/>fileutil, types<br/>tls helpers"]
+        clientv3["client/v3<br/>go.etcd.io/etcd/client/v3<br/>─────────────<br/>Official Go SDK<br/>KV, Watch, Lease"]
+        pkg["pkg/v3<br/>go.etcd.io/etcd/pkg/v3<br/>─────────────<br/>idutil, schedule<br/>traceutil, wait"]
+        server["server/v3<br/>go.etcd.io/etcd/server/v3<br/>─────────────<br/>Core engine<br/>Raft, MVCC, WAL"]
+        etcdctl["etcdctl/<br/>─────────────<br/>CLI client tool"]
+        etcdutl["etcdutl/<br/>─────────────<br/>Offline admin tool"]
+    end
+
+    api --> server
+    api --> clientv3
+    clientpkg --> server
+    clientpkg --> clientv3
+    pkg --> server
+    clientv3 --> etcdctl
+    server --> etcdctl
+    server --> etcdutl
+```
+
+### Key Directories Inside `server/v3`
+
+| Package path                  | Responsibility                                      |
+| ----------------------------- | --------------------------------------------------- |
+| `etcdserver/`                 | Main server orchestrator, applies Raft commits      |
+| `etcdserver/apply/`           | Unmarshals committed entries, dispatches to storage |
+| `etcdserver/txn/`             | Individual Put / Range / Delete / Txn logic         |
+| `etcdserver/api/rafthttp/`    | HTTP/2 transport for Raft peer messages             |
+| `etcdserver/api/membership/`  | Cluster topology, learner nodes, ConfChange         |
+| `etcdserver/api/snap/`        | Snapshot save/restore to `.snap` files              |
+| `etcdserver/api/v3compactor/` | Periodic & revision-based auto-compaction           |
+| `storage/wal/`                | Append-only Write-Ahead Log                         |
+| `storage/backend/`            | BoltDB wrapper with batched transaction scheduling  |
+| `storage/mvcc/`               | Multi-version key store on top of BoltDB            |
+| `lease/`                      | Lease grant, keepalive, expiry engine               |
+| `auth/`                       | RBAC user/role management, JWT/simple token         |
+| `embed/`                      | `Etcd` struct — embeds a full etcd node in-process  |
+
+---
+
+## 3. The Big Picture: Write Flow
+
+When a client calls `Put("foo", "bar")`, the request travels through every layer of the stack:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Client as Client (etcdctl/SDK)
-    participant gRPC as gRPC Server (v3_server.go)
-    participant Raft as Raft Node (raft.go)
-    participant WAL as Write-Ahead Log (WAL)
-    participant Apply as Applier (apply.go)
-    participant MVCC as MVCC Engine (kvstore.go)
-    participant BoltDB as Backend DB (BoltDB)
+    participant C as Client SDK
+    participant G as gRPC Handler v3_server.go
+    participant R as Raft Node raft.go
+    participant P as Peer Nodes network
+    participant W as WAL storage/wal
+    participant A as Applier etcdserver/apply
+    participant M as MVCC Store storage/mvcc
+    participant B as BoltDB storage/backend
 
-    Client->>gRPC: Put("foo", "bar")
-    gRPC->>Raft: Propose(PutRequest)
-    Note over Raft: Replicates proposal to other nodes and waits for consensus (quorum)
-    Raft->>WAL: Save HardState & Entries to Disk
-    WAL-->>Raft: Fsync completed
-    Raft-->>Apply: Committed Entries (Ready channel)
-    Apply->>MVCC: Put("foo", "bar")
-    Note over MVCC: 1. Update in-memory B-Tree index\n2. Write to BoltDB with Revision key
-    MVCC->>BoltDB: Write Revision -> mvccpb.KeyValue
-    gRPC-->>Client: PutResponse
+    C->>G: Put(key=foo, val=bar)
+    G->>G: Auth check + quota check
+    G->>R: propose(InternalRaftRequest)
+    Note over R: Leader encodes entry into Raft log
+    R-->>P: AppendEntries RPC replicate
+    R->>W: Save(HardState, Entries) parallel with network
+    P-->>R: AppendEntries response quorum ack
+    Note over R: Entry is now COMMITTED
+    R->>A: applyc toApply entries
+    A->>A: Unmarshal entry dispatch
+    A->>M: TxnWrite.Put(key, val, rev)
+    M->>B: batchTx.UnsafeSeqPut bucket revKey value
+    B-->>M: buffered not yet flushed
+    M-->>A: done
+    A-->>G: notifyc signal
+    G-->>C: PutResponse Revision N
 ```
 
-### Flow Breakdown:
-1. **The gRPC Layer**: The client makes a call to the gRPC endpoint. [v3_server.go](server/etcdserver/v3_server.go#L295) receives the request and wraps it in a proposal.
-2. **Raft Proposal**: The server proposes this write to its local Raft consensus engine.
-3. **Consensus**: Raft replicates this command to peer servers. Once a majority (quorum) of servers acknowledge it, the entry is marked as **committed**.
-4. **WAL (Write-Ahead Log)**: The node immediately writes the committed entry to its append-only WAL file on disk. This guarantees durability if the server crashes.
-5. **Applier**: The local server consumes the committed log entries from Raft's `Ready()` channel and runs the apply loop.
-6. **MVCC Storage**: The applier writes the data to the Multi-Version Concurrency Control (MVCC) store.
-7. **BoltDB**: The MVCC store writes the serialized key-value pair into BoltDB (a simple B+ tree database on disk).
-8. **gRPC Response**: Once the write is finalized, the gRPC handler wakes up and returns success to the client.
+### Step-by-Step Breakdown
+
+1. **Auth & Quota** — [`v3_server.go`](server/etcdserver/v3_server.go) intercepts the gRPC call, validates the auth token and checks if the backend quota is exceeded.
+2. **Raft Proposal** — The server wraps the request in an `InternalRaftRequest` proto and proposes it to the local Raft node via `node.Propose()`.
+3. **Replication** — The Raft leader sends `AppendEntries` RPCs to all follower peers via [`rafthttp/transport.go`](server/etcdserver/api/rafthttp/transport.go).
+4. **WAL Write** — The leader writes the entry to its own WAL **in parallel** with the network round-trip (see §5).
+5. **Commit** — Once a quorum of nodes acknowledge, the entry is marked **committed** in the Raft log.
+6. **Apply Loop** — [`server.go`](server/etcdserver/server.go) reads from the `applyc` channel and calls the Applier chain.
+7. **MVCC Write** — The MVCC store assigns a monotonically increasing **Revision** and stores the key-value pair in BoltDB under that revision key.
+8. **Response** — The gRPC handler was waiting on a `wait.Wait` channel keyed to the proposal ID; once applied, it is woken up and returns success.
 
 ---
 
-## 3. The Nuts & Bolts: Directory Map & Repo Structure
+## 4. Startup & Bootstrap
 
-The `etcd` repository is organized as a modular Go workspace. Here is the visual tree of the key packages and files, followed by a breakdown of **which files sit where, and why**.
+Before etcd can serve traffic, it must reconstruct its state from disk. The [`bootstrap.go`](server/etcdserver/bootstrap.go) function handles all startup paths.
 
-### Visual Directory Tree
+```mermaid
+flowchart TD
+    Start([etcd process starts]) --> CheckWAL{WAL exists on disk?}
 
+    CheckWAL -- No --> CheckSnap{Snapshot file exists?}
+    CheckSnap -- No --> NewCluster[Bootstrap new cluster<br/>Generate member ID<br/>Write initial cluster config<br/>Create empty WAL]
+    CheckSnap -- Yes --> RestoreSnap[Restore from snapshot<br/>Load .snap file<br/>Replay WAL entries after snap index]
+
+    CheckWAL -- Yes --> LoadWAL[Open existing WAL<br/>Read all records<br/>Verify CRC checksums<br/>Replay log entries]
+    LoadWAL --> HasSnap{Snapshot reference in WAL?}
+    HasSnap -- Yes --> LoadBolt[Load BoltDB from snapshot plus WAL delta]
+    HasSnap -- No --> LoadBolt
+
+    NewCluster --> InitBackend[Init BoltDB backend]
+    RestoreSnap --> LoadBolt
+    LoadBolt --> InitBackend
+
+    InitBackend --> InitMVCC[Init MVCC store<br/>kvstore plus index]
+    InitMVCC --> InitLease[Init Lessor<br/>restore lease map]
+    InitLease --> InitRaft[Start Raft node<br/>go.etcd.io/raft/v3]
+    InitRaft --> InitTransport[Start rafthttp transport<br/>Dial peers]
+    InitTransport --> Ready([Server ready - Serving gRPC])
 ```
-etcd/ (Root Workspace)
-├── go.work                           # Manages multiple Go modules in the workspace
-├── api/                              # Module: Protobuf & gRPC interfaces
-│   └── etcdserverpb/
-│       ├── rpc.proto                 # API service definitions (KV, Watch, Lease, etc.)
-│       └── raft_internal.proto       # Proto schema for internal Raft logs
-├── client/                           # Client SDK modules
-│   └── v3/                           # Module: official Go Client SDK
-│       ├── client.go                 # Client initialization & credentials
-│       ├── kv.go                     # Implements client KV methods (Put, Get, Txn)
-│       └── watch.go                  # Implements Watch client streams
-├── etcdctl/                          # CLI tool for clients
-│   └── main.go                       # Entrypoint for command-line tool
-├── etcdutl/                          # Offline admin tool
-│   └── main.go                       # Entrypoint for admin snapshots & DB defrags
-└── server/                           # Module: Core Server Engine
-    ├── main.go                       # Standard executable entrypoint (invokes etcdmain)
-    ├── etcdmain/                     # Command-line parsing & startup bootstrapping
-    ├── etcdserver/                   # Main etcd server orchestration
-    │   ├── server.go                 # Core server loop & apply dispatcher
-    │   ├── raft.go                   # Bridges etcdserver with go.etcd.io/raft consensus
-    │   ├── v3_server.go              # Implements the gRPC service endpoints
-    │   ├── apply/
-    │   │   ├── apply.go              # Marshals entries & dispatches to the correct applier
-    │   │   └── backend.go            # Evaluates requests against MVCC & Lease engine
-    │   └── txn/
-    │       ├── put.go                # Applies individual Put operations
-    │       ├── range.go              # Applies Range/Get operations
-    │       └── txn.go                # Coordinates Multi-operation Transactions
-    ├── lease/                        # Ephemeral TTL & Lease management
-    │   ├── lessor.go                 # The Lessor manager engine
-    │   └── lease.go                  # Model for a single Lease
-    └── storage/                      # Storage Engines
-        ├── wal/                      # Write-Ahead Logging
-        │   └── wal.go                # Append-only journal for raft log replication
-        ├── backend/                  # Persistent database wrapper
-        │   └── backend.go            # Scheduled transaction batcher for BoltDB
-        └── mvcc/                     # Multi-Version Concurrency Control (revisions)
-            ├── kvstore.go            # High-level MVCC coordinator
-            ├── key_index.go          # In-memory B-Tree index (Key -> Revisions)
-            └── watchable_store.go    # Hook for client watch subscriptions
-```
+
+### What `bootstrap.go` Actually Does
+
+- **`haveWAL := wal.Exist(cfg.WALDir())`** — single boolean that selects the startup path.
+- **`bootstrapBackend()`** — opens or creates the BoltDB file, sets up the `backend.Backend` with batch interval (`100ms`, limit `10000`).
+- **`bootstrapSnapshot()`** — loads the most recent `.snap` file to get the last committed state machine snapshot.
+- After reconstruction, `NewServer()` in [`server.go`](server/etcdserver/server.go) wires everything together: the Raft node, MVCC store, Lessor, Auth store, and gRPC server.
 
 ---
 
-### Which File Sits Where, and Why?
+## 5. Raft: The Consensus Engine
 
-#### 1. The API Module (`/api/`)
-* **[rpc.proto](api/etcdserverpb/rpc.proto)**
-  * *Why here:* To decouple client/server contracts from internal implementations. Because this defines the exact gRPC API structure, both the client SDK (`client/v3`) and the server engine (`server`) reference this single source of truth.
-* **[raft_internal.proto](api/etcdserverpb/raft_internal.proto)**
-  * *Why here:* Defines the wrapper messages (like `InternalRaftRequest`) used when pushing operations through Raft. It belongs here because it dictates the serialization standard of the entries stored inside WAL files and sent across nodes.
+etcd delegates all consensus to the external library `go.etcd.io/raft/v3`. The bridge between etcd and this library is [`raft.go`](server/etcdserver/raft.go), which runs a dedicated goroutine consuming the `Ready()` channel.
 
-#### 2. The Client SDK Module (`/client/v3/`)
-* **[client.go](client/v3/client.go)**
-  * *Why here:* Serves as the developer entrance to the client SDK. It manages network dialing, gRPC retry interceptors, and credentials, acting as a gateway to KV, Watch, and Lease subsystems.
-* **[kv.go](client/v3/kv.go)** & **[watch.go](client/v3/watch.go)**
-  * *Why here:* Keeps the developer-facing SDK files segregated by concern. `kv.go` handles standard CRUD methods, while `watch.go` manages long-running HTTP/2 stream multiplexing for real-time notifications.
+```mermaid
+sequenceDiagram
+    participant T as ticker heartbeat
+    participant RN as raft.Node go.etcd.io/raft
+    participant E as raftNode.start raft.go
 
-#### 3. Core Server Engine Modules (`/server/`)
-* **[server/main.go](server/main.go)**
-  * *Why here:* The wrapper executable target. It does not contain server business logic; it merely pulls in the bootstrapper `etcdmain` and runs it.
-* **[server/etcdserver/server.go](server/etcdserver/server.go)**
-  * *Why here:* This is the orchestrator. It manages the server's state, coordinates cluster membership, triggers snapshots, and processes local progress. It sits at this level because it needs to access Raft, the Storage Engine, and the Leases layer concurrently.
-* **[server/etcdserver/raft.go](server/etcdserver/raft.go)**
-  * *Why here:* Connects the server to the external `go.etcd.io/raft` library. It drives the consensus loop (`Ready()`), coordinates RPCs to send to peers, and hands off committed blocks to the apply loop.
-* **[server/etcdserver/v3_server.go](server/etcdserver/v3_server.go)**
-  * *Why here:* Implements the gRPC APIs defined in `rpc.proto`. It acts as the gatekeeper, receiving client requests, verifying authorization, proposing them to Raft, and waiting for the write to commit.
-* **[server/etcdserver/apply/apply.go](server/etcdserver/apply/apply.go)**
-  * *Why here:* Decouples entry retrieval from execution. When a node commits an entry, `apply.go` marshals the raw bytes into Go structs, checks permissions and quotas, and routes them to the underlying storage applier.
-* **[server/etcdserver/txn/put.go](server/etcdserver/txn/put.go)** & **[range.go](server/etcdserver/txn/range.go)**
-  * *Why here:* Splits execution logic. Keeping `Put`, `Range` (Get), and `Txn` logic separated makes modifying transaction behavior modular and isolates them from the general server lifecycle code.
+    loop Every heartbeat tick
+        T->>E: ticker.C fires
+        E->>RN: r.Tick()
+    end
 
-#### 4. The Lease Module (`/server/lease/`)
-* **[lessor.go](server/lease/lessor.go)**
-  * *Why here:* The lessor manager engine. It handles creating leases and runs a background loop to automatically expire lease-bound keys. It is a standalone package because both the MVCC storage engine (to clean up keys) and the gRPC handlers need access to it.
+    RN-->>E: rd from r.Ready()
+    Note over E: rd contains CommittedEntries Messages HardState Entries Snapshot
 
-#### 5. Storage Engines (`/server/storage/`)
-* **[server/storage/wal/wal.go](server/storage/wal/wal.go)**
-  * *Why here:* Handles Write-Ahead Logging. Before any write is applied to the state machine, it must be recorded on disk. `wal.go` implements fast sequential file appending and syncs data to disk (`fsync`) for disaster recovery.
-* **[server/storage/backend/backend.go](server/storage/backend/backend.go)**
-  * *Why here:* Serves as a transactional scheduler over BoltDB. Standard BoltDB locks during commits; `backend.go` batches writes to run concurrently and caches reads via buffers to maximize performance.
-* **[server/storage/mvcc/kvstore.go](server/storage/mvcc/kvstore.go)**
-  * *Why here:* High-level coordinator of the Multi-Version Concurrency Control engine. It bridges backend transactions and the in-memory index.
-* **[server/storage/mvcc/key_index.go](server/storage/mvcc/key_index.go)**
-  * *Why here:* Houses the in-memory B-Tree index definitions (`keyIndex` and `generation`). It is situated under the `mvcc` directory because this index is an implementation detail of the multi-version storage design (mapping keys to historical revisions).
-* **[server/storage/mvcc/watchable_store.go](server/storage/mvcc/watchable_store.go)**
-  * *Why here:* Extends the basic key-value store with notification triggers. It intercepts database updates on transaction commit and routes events to active Watch streams.
+    E->>E: r.applyc toApply CommittedEntries
+    Note over E: Apply sent FIRST before disk write
+
+    alt Node is Leader
+        E->>E: r.transport.Send rd.Messages
+        Note right of E: Network send PARALLEL with disk write
+    end
+
+    E->>E: r.storage.Save rd.HardState rd.Entries
+    Note over E: WAL fsync guarantees durability before ack
+
+    alt Node is Follower
+        E->>E: WAL Save THEN transport.Send
+        Note right of E: Followers persist BEFORE replying to leader
+    end
+
+    E->>RN: r.Advance()
+    Note over E: Signal raft lib that Ready batch is consumed
+```
+
+### The Leader Parallelism Optimization
+
+The critical optimization at [`raft.go:240-258`](server/etcdserver/raft.go#L240-L258):
+
+- **Leader**: sends `rd.Messages` to peers **and** saves to WAL **concurrently**. Network RTT and disk I/O overlap — reducing commit latency significantly.
+- **Follower**: must `Save()` to WAL and `fsync` **before** sending any reply to the leader. This prevents the follower from acknowledging an entry it hasn't persisted, which would risk data loss on a crash.
+
+This asymmetry is the key reason why etcd can achieve both **low latency** and **strict durability**.
 
 ---
 
-## 4. Deep Dives: Key Concepts
+## 6. WAL: Write-Ahead Log
 
-### A. How MVCC (Multi-Version Concurrency Control) Works
-In a standard SQL database, updating a key overwrites the old value. If another client is reading while you write, they might get partial data, or you have to block them using locks.
+The WAL lives in `storage/wal/`. It is an **append-only journal** segmented into fixed-size files (default 64MB each). Every `HardState`, `Entry`, `Snapshot`, and `CRC` record is written as a framed protobuf record.
 
-`etcd` avoids locks for readers using **revisions**:
-- Every write increments a global counter called the **Revision** (e.g., Revision 1, Revision 2, etc.).
-- Old values are **never overwritten**. Instead, a new version of the key is saved under the new revision.
-- Because old revisions are kept, readers can read the database as it looked at a specific historical point (e.g., "Give me the value of `/foo` at Revision 4").
+```mermaid
+stateDiagram-v2
+    [*] --> Creating : wal.Create()
 
-#### The B-Tree Index vs. BoltDB
-BoltDB is a key-value store, but its keys are **not** the user keys (like `/foo`). 
-Instead:
-- **BoltDB keys** are the **Revision numbers** (e.g. `Revision {Main: 4, Sub: 0}`).
-- **BoltDB values** are the marshaled `mvccpb.KeyValue` protobufs (which contain the actual key `/foo` and value `bar`).
-- To find a key by its name, etcd keeps an **in-memory B-Tree index** (`kvindex`). 
-  The index maps user keys (e.g. `/foo`) to a `keyIndex` struct that holds the history of revisions for that key.
+    Creating --> Open : First segment created
+
+    Open --> Appending : Save(HardState, Entries)
+    Appending --> Appending : Entries fill segment
+    Appending --> Rotating : Segment reaches 64MB
+    Rotating --> Open : New segment file created index-term.wal
+
+    Appending --> Syncing : fsync called after each Ready batch
+    Syncing --> Appending : Sync complete
+
+    Open --> Snapshotting : SaveSnap called
+    Snapshotting --> Open : .snap file written WAL snap record appended
+
+    Open --> Truncating : Release snapshot - old segments before snap index deleted
+    Truncating --> Open : Old .wal files purged
+
+    Open --> [*] : wal.Close()
+```
+
+### WAL Record Types
+
+| Record Type    | When Written       | Purpose                                              |
+| -------------- | ------------------ | ---------------------------------------------------- |
+| `metadataType` | Once at creation   | Cluster metadata, node ID                            |
+| `entryType`    | Every `Save()`     | Raw Raft log entries (the actual proposals)          |
+| `stateType`    | Every `Save()`     | HardState: `{Term, Vote, Commit}` — survives crashes |
+| `snapshotType` | Every `SaveSnap()` | Marks the snapshot boundary for truncation           |
+| `crcType`      | Segment header     | CRC32 checksum — detected by `repair.go` on recovery |
+
+**Why WAL before BoltDB?** — If the process crashes after writing BoltDB but before logging to WAL, the entry would be lost. By writing WAL **first** (with `fsync`), recovery can always replay missed entries.
+
+---
+
+## 7. MVCC & the Storage Engine
+
+etcd uses **Multi-Version Concurrency Control** to avoid read-write lock contention and provide point-in-time historical reads.
+
+### The Core Insight
+
+BoltDB is used as a **revision-indexed store**, not a key-indexed store:
+
+| Layer                            | Key                                             | Value                                                         |
+| -------------------------------- | ----------------------------------------------- | ------------------------------------------------------------- |
+| **BoltDB** (`key` bucket)        | `Revision{Main: N, Sub: 0}` (8-byte big-endian) | `mvccpb.KeyValue` protobuf (contains actual key + value)      |
+| **In-memory B-Tree** (`kvindex`) | User key e.g. `/foo`                            | `keyIndex` struct → list of `generation` → list of `Revision` |
 
 ```mermaid
 graph TD
-    subgraph IM["In-Memory Index (B-Tree)"]
-        K["Key: '/foo'"] --> KI["keyIndex struct"]
-        KI --> G1["Generation 1 (Active)"]
-        G1 --> R2["Revision {Main: 4, Sub: 0}"]
-        G1 --> R1["Revision {Main: 2, Sub: 0}"]
-    end
-    subgraph DB["Disk-Backend (BoltDB)"]
-        R1 --> DB1["Key: '00000002_00000000' \n Value: mvccpb.KeyValue{key: '/foo', value: 'first_value'}"]
-        R2 --> DB2["Key: '00000004_00000000' \n Value: mvccpb.KeyValue{key: '/foo', value: 'latest_value'}"]
-    end
+    UserKey["User Key e.g. /foo"]
+
+    UserKey --> keyIndex["keyIndex struct - key_index.go<br/>key: /foo<br/>modified: Rev 5,0<br/>generations list"]
+
+    keyIndex --> G1["generation 0 deleted<br/>created: Rev 1,0<br/>revs: Rev 1,0 - Rev 2,0 - Rev 3,0 tombstone"]
+
+    keyIndex --> G2["generation 1 current<br/>created: Rev 4,0<br/>revs: Rev 4,0 - Rev 5,0"]
+
+    G1 --> R1["BoltDB Rev 1,0<br/>key=/foo val=bar1"]
+    G1 --> R2["BoltDB Rev 2,0<br/>key=/foo val=bar2"]
+    G1 --> R3["BoltDB Rev 3,0<br/>tombstone - deleted"]
+
+    G2 --> R4["BoltDB Rev 4,0<br/>key=/foo val=newval"]
+    G2 --> R5["BoltDB Rev 5,0<br/>key=/foo val=latest"]
 ```
 
-### B. Compaction
-Since revisions are kept forever, the database would eventually run out of disk space.
-To prevent this, etcd supports **Compaction**. Compaction deletes history before a given revision, freeing up disk space in BoltDB.
+### How a `Put` Becomes a Revision
 
-### C. Leases
-A **Lease** allows a client to group keys together under a single lifetime.
-- When a lease expires (e.g., the client failed to send a keepalive heart-beat due to network outage), etcd automatically deletes all keys bound to that lease.
-- This is incredibly useful for service discovery and distributed locks (e.g. "I am alive; if I disappear, delete my lock").
+1. `kvstore.Put()` → acquires `revMu` write lock, increments `currentRev`.
+2. Calls `batchTx.UnsafeSeqPut("key", revBytes, kvBytes)` — writes the encoded `KeyValue` into BoltDB's in-memory buffer.
+3. Calls `index.Put(key, revision)` — updates the in-memory B-Tree `keyIndex`.
+4. On `batchTx.Commit()` (triggered by the backend interval timer), the buffer is flushed to BoltDB pages and `fsync`'d.
 
-### D. Watches
-A client can open a streaming gRPC connection to **Watch** a key or a range of keys.
-- Every time a transaction updates a watched key, the MVCC watchable store (`watchable_store.go`) catches it and sends the revision update down the gRPC stream to the client.
-- The client can also watch from a historical revision (e.g. "Watch for all changes since Revision 10").
+### How a `Get` Resolves a Key
 
-### E. Concurrency Boundary: Parallel WAL Write & Network Replication
-To achieve high throughput, `etcd` introduces a critical concurrency optimization during Raft log replication.
-
-* **The Leader Parallelism (Optimistic Replication)**:
-  * When a Raft leader node receives a proposal, it does **not** write to disk and wait before contacting the network.
-  * In the main loop within [raft.go](server/etcdserver/raft.go#L240-L243), the leader broadcasts the replication messages to peer nodes over the network (`r.transport.Send(...)`) **in parallel** with committing entries to its own local disk WAL journal (`r.storage.Save(...)`).
-  * By overlapping network round-trip time with local disk I/O latency, the overall block commitment path is significantly shortened.
-* **The Follower Safety Boundary**:
-  * Unlike the leader, followers cannot process network propagation and disk writing in parallel.
-  * Followers must write and sync (`fsync`) entries to their WAL disk logs ([raft.go](server/etcdserver/raft.go#L297-L302)) **before** replying back to the leader. This strict serialization prevents data loss or split-brain states in the event of a crash-recovery cycle.
-
-### F. BoltDB Batching & Buffer Commit Mechanics
-Writing directly to BoltDB disk pages on every key-value request would degrade performance due to the overhead of BoltDB's B+tree index restructuring and disk syncing (`fsync`).
-
-* **Batched Transactions (`batchTxBuffered`)**:
-  * Instead of committing to the DB page file on every client write, the backend wrapper accumulates changes inside an in-memory buffer (`txReadBuffer`).
-  * These accumulated writes are periodically committed to BoltDB as a single batch, triggered either when:
-    1. The time interval configured passes (`batchInterval`, default `100ms`).
-    2. The number of buffered mutations hits the threshold (`batchLimit`, default `10,000` operations).
-* **Consistent Concurrent Reads**:
-  * Reads do not wait for the flush cycle. If a reader only searched the on-disk BoltDB tables, it would fail to read recently updated values that are still buffered in memory.
-  * To solve this, `ConcurrentReadTx` reads from BoltDB *and* queries the active in-memory `txReadBuffer` ([backend.go](server/storage/backend/backend.go#L115-L120)). Values present in the buffer are merged with disk-read data, ensuring read linearizability without blocking write paths.
+1. `kvstore.Range()` → calls `index.Get(key, atRev)` on the B-Tree.
+2. The B-Tree returns the matching `Revision` (latest, or historical if `atRev` is specified).
+3. `batchTx.UnsafeRange("key", revKey, ...)` reads from BoltDB (or the in-memory buffer if not yet flushed).
 
 ---
 
-## 5. Structured Fan-Out Learning Strategy
+## 8. BoltDB Backend & Batching
 
-To learn every nut and bolt of `etcd`, follow this 6-phase fan-out strategy:
+Writing directly to BoltDB on every client request would be prohibitively slow — BoltDB takes an exclusive write lock and `fsync`s the file on every commit. The [`backend.go`](server/storage/backend/backend.go) layer solves this with batched transactions.
 
-```
-                  ┌──────────────────────────────┐
-                  │ Phase 1: Request Lifecycle   │
-                  └──────────────┬───────────────┘
-                                 │
-         ┌───────────────────────┼───────────────────────┐
-         ▼                       ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ Phase 2: Raft   │     │ Phase 3: MVCC & │     │ Phase 4: Leases │
-│ & Consensus     │     │ Storage Engine  │     │ & Watches       │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-                                 ▼
-                  ┌──────────────────────────────┐
-                  │ Phase 5: Client & Utilities  │
-                  └──────────────┬───────────────┘
-                                 │
-                                 ▼
-                  ┌──────────────────────────────┐
-                  │ Phase 6: System Operations   │
-                  └──────────────────────────────┘
+```mermaid
+flowchart TD
+    Write["kvstore.Put<br/>batchTx.UnsafeSeqPut"]
+
+    Write --> Buffer["txWriteBuffer in-memory map<br/>Accumulates key/value pairs"]
+
+    Buffer --> Timer{"Flush trigger?"}
+    Timer -- "100ms interval elapsed OR 10000 ops buffered" --> Commit["batchTx.Commit<br/>Begin BoltDB write txn<br/>Copy buffer to BoltDB pages<br/>boltDB.Commit plus fsync<br/>Reset buffer"]
+    Timer -- Not yet --> Buffer
+
+    Commit --> ReadBuf["txReadBuffer updated<br/>mirrors write buffer for concurrent reads"]
+
+    Read["ConcurrentReadTx.UnsafeRange<br/>any goroutine any time"] --> CheckBuf{"Key in txReadBuffer?"}
+    CheckBuf -- "Yes - recently written not yet flushed" --> ReadBuf
+    CheckBuf -- "No - older data" --> BoltDB["BoltDB on-disk pages already committed"]
+
+    ReadBuf --> Result["Value returned to caller"]
+    BoltDB --> Result
 ```
 
-### Phase 1: Request Lifecycle (Start Here)
-Trace how a single write is accepted and executed.
-- [ ] Read [v3_server.go](server/etcdserver/v3_server.go) to see how client requests are received.
-- [ ] Understand `raftRequest` and how entries are proposed.
-- [ ] Look at `applyAll` and `applyEntries` in [server.go](server/etcdserver/server.go#L972) to see how committed logs trigger changes.
-- [ ] See how [apply.go](server/etcdserver/apply/apply.go) unpacks the request and dispatches it.
+### Key Types in the Backend
 
-### Phase 2: Raft Consensus & Integration
-Learn how the node communicates with the cluster to keep logs identical.
-- [ ] Study [raft.go](server/etcdserver/raft.go) to see how the raft node loop (`Ready()`) handles ticks, snapshots, and replication messages.
-- [ ] Inspect how WAL files are written in [server/storage/wal](server/storage/wal) to guarantee disk durability before consensus.
+| Type               | File           | Role                                         |
+| ------------------ | -------------- | -------------------------------------------- |
+| `backend`          | `backend.go`   | Owns the `bolt.DB`, runs the commit loop     |
+| `batchTxBuffered`  | `batch_tx.go`  | Accumulates writes in `txWriteBuffer`        |
+| `readTx`           | `read_tx.go`   | Standard read tx — locks during writes       |
+| `ConcurrentReadTx` | `read_tx.go`   | Non-blocking read — uses buffered snapshot   |
+| `txReadBuffer`     | `tx_buffer.go` | Sorted in-memory bucket map for fast lookups |
 
-### Phase 3: MVCC & Storage Engine
-Learn how etcd provides transactional consistency and maintains historical revision data on top of BoltDB.
-- [ ] Read the definition of `KV` and `TxnWrite` in [kv.go](server/storage/mvcc/kv.go).
-- [ ] Examine [key_index.go](server/storage/mvcc/key_index.go) to see how in-memory key-to-revision mappings and key generations are implemented.
-- [ ] Trace `kvstore.go` and `kvstore_txn.go` in [server/storage/mvcc](server/storage/mvcc) to see how reads/writes translate to BoltDB operations.
-- [ ] Read [backend.go](server/storage/backend/backend.go) to see how etcd buffers and schedules transaction batching to BoltDB.
+The `ConcurrentReadTx` is the critical path for etcd's linearizable reads: it merges the on-disk BoltDB data with the still-in-flight write buffer so readers always see the latest writes without waiting for a flush.
 
-### Phase 4: Leases & Watches
-Understand ephemeral data and real-time streaming updates.
-- [ ] Study [lessor.go](server/lease/lessor.go) to see how leases are granted, updated, and revoked, and how the lessor runs a background thread to find expired leases.
-- [ ] Read [watchable_store.go](server/storage/mvcc/watchable_store.go) and [watcher.go](server/storage/mvcc/watcher.go) to learn how the watch stream triggers when transactions commit.
+---
 
-### Phase 5: Client Libraries & CLI Tools
-Understand how external applications and operators talk to the engine.
-- [ ] Check out the API contract protocols in [api/etcdserverpb/rpc.proto](api/etcdserverpb/rpc.proto).
-- [ ] Look at [client/v3/client.go](client/v3/client.go) to understand the official SDK implementation.
-- [ ] Browse the CLI handlers in [etcdctl](etcdctl) and [etcdutl](etcdutl).
+## 9. Leases
 
-### Phase 6: System Operations (Advanced)
-Study how etcd maintains health, recovery, and cluster membership.
-- [ ] Look at the cluster membership logic in [server/etcdserver/api/membership/](server/etcdserver/api/membership).
-- [ ] Read [bootstrap.go](server/etcdserver/bootstrap.go) to see how etcd starts up, recovers from snapshot/WAL, and discovers peers.
-- [ ] Study the database defragmentation (`Defrag()`) process in [backend.go](server/storage/backend/backend.go#L69).
+A **Lease** groups keys under a single TTL. When the lease expires, all attached keys are automatically deleted. This is the primitive powering Kubernetes pod health registration and distributed locks.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Granted : LeaseGrant ttl=30s<br/>Assign LeaseID<br/>Store in lessor.leaseMap<br/>Persist to BoltDB
+
+    Granted --> Active : Client attaches keys via Put with leaseID
+
+    Active --> Active : LeaseRenew id<br/>keepalive resets expiry timer
+
+    Active --> CheckpointLogged : Every 5 min default<br/>remainingTTL checkpointed to Raft log
+
+    CheckpointLogged --> Active : Followers apply checkpoint<br/>prevents full TTL reset after leader failover
+
+    Active --> Expired : No keepalive within TTL<br/>lessor.revokeExpiredLease
+
+    Expired --> Revoking : Propose LeaseRevoke to Raft
+
+    Revoking --> Revoked : Committed by Raft<br/>Delete all attached keys<br/>Remove from leaseMap<br/>Remove from BoltDB
+
+    Revoked --> [*]
+
+    Granted --> Revoked : Explicit LeaseRevoke id
+```
+
+### The Lease Expiry Loop
+
+[`lessor.go`](server/lease/lessor.go) runs a background goroutine (`runLoop`) that:
+
+1. Every `500ms`, iterates the `leaseExpiredNotifier` min-heap (ordered by expiry time).
+2. Identifies all leases where `expiry <= now`.
+3. Batches up to `defaultLeaseRevokeRate` (1000/sec) into a `LeaseRevoke` proposal and proposes it to Raft.
+4. The Raft-committed revoke triggers the MVCC `TxnDelete` to remove all keys with that `LeaseID`.
+
+### Lease Checkpointing
+
+Without checkpointing, a leader failover would reset all lease TTLs to their original values (because the new leader only knows the grant time, not elapsed time). The **checkpoint** mechanism periodically logs the `remainingTTL` to the Raft log so followers track elapsed time correctly.
+
+---
+
+## 10. Watches
+
+Watches allow clients to receive a streaming gRPC notification for every mutation on a key or key-range, starting from any historical revision. The implementation is in [`watchable_store.go`](server/storage/mvcc/watchable_store.go).
+
+```mermaid
+flowchart TD
+    Client["Client: WatchCreate key=/foo startRev=10"]
+
+    Client --> WatchServer["v3rpc/watch.go<br/>watchServer.recvLoop"]
+    WatchServer --> NewWatcher["watchableStore.watch<br/>Create watcher id key startRev<br/>Add to unsynced if startRev less than currentRev<br/>Add to synced if startRev equals currentRev"]
+
+    NewWatcher --> SyncCheck{"startRev less than currentRev?"}
+
+    SyncCheck -- "Yes - historical range" --> Unsynced["unsynced watcherGroup<br/>Background syncWatchers loop<br/>Reads BoltDB range startRev to currentRev<br/>Sends historical events to watcher channel<br/>Moves watcher to synced when caught up"]
+
+    SyncCheck -- "No - real-time" --> Synced["synced watcherGroup<br/>map: key to watcher set"]
+
+    Unsynced --> Synced
+
+    Synced --> TxNotify["After every batchTx.Commit<br/>watchableStore.notify rev evs"]
+
+    TxNotify --> Match{"Key matches synced watchers?"}
+
+    Match -- Yes --> Send["Send WatchEvent to watcher.ch buf=128<br/>watchResponse to gRPC stream"]
+
+    Match -- No --> Drop["Skip"]
+
+    Send --> Victim{"Channel full slow consumer?"}
+    Victim -- Yes --> VictimList["Move watcher to victims slice<br/>Retry in 100ms loop"]
+    Victim -- No --> ClientRecv["Client receives WatchEvent kv type rev"]
+
+    VictimList --> Send
+```
+
+### Watcher Groups
+
+| Group      | Description                                                                     |
+| ---------- | ------------------------------------------------------------------------------- |
+| `synced`   | Watchers that have caught up — notified inline on every commit via `notify()`   |
+| `unsynced` | Watchers catching up from a historical revision — drained by `syncWatchersLoop` |
+| `victims`  | Synced watchers whose channel was full; retried every `100ms`                   |
+
+The `syncWatchersLoop` goroutine runs every `100ms` to drain the unsynced group and retry victims, ensuring no watcher is permanently blocked by a slow consumer.
+
+---
+
+## 11. Compaction
+
+Since every write creates a new revision and old revisions are never overwritten, the BoltDB file would grow unboundedly. **Compaction** deletes all revisions below a target revision, reclaiming disk space.
+
+```mermaid
+flowchart TD
+    Trigger{"Auto-compaction trigger source?"}
+
+    Trigger -- "Periodic mode --auto-compaction-mode=periodic" --> Periodic["v3compactor/periodic.go<br/>Every compaction-retention interval e.g. 1h<br/>calculate target revision"]
+
+    Trigger -- "Revision mode --auto-compaction-mode=revision" --> RevMode["v3compactor/revision.go<br/>When currentRev minus compactRev exceeds retention count<br/>calculate target revision"]
+
+    Periodic --> ProposeCompact["Propose Compact rev=N to Raft<br/>goes through consensus"]
+    RevMode --> ProposeCompact
+
+    ProposeCompact --> Committed["Entry committed by Raft<br/>apply/backend.go executes kv.Compact rev"]
+
+    Committed --> ScheduleFIFO["Enqueue in FIFO scheduler<br/>kvstore.go fifoSched<br/>serializes with writes"]
+
+    ScheduleFIFO --> PhaseOne["Phase 1: In-memory index<br/>Walk keyIndex B-Tree<br/>Remove revision entries at or below compactRev<br/>Remove empty generations<br/>Remove empty keyIndex nodes"]
+
+    PhaseOne --> PhaseTwo["Phase 2: BoltDB<br/>Batch delete BoltDB entries for removed revisions<br/>1000 keys per batch defaultCompactionBatchLimit<br/>Sleep 10ms between batches avoid blocking reads"]
+
+    PhaseTwo --> Done["compactMainRev updated<br/>Old BoltDB pages marked free<br/>not yet reclaimed on disk"]
+
+    Done --> Defrag{"Defrag triggered?"}
+    Defrag -- "Manual or scheduled" --> DefragOp["backend.Defrag<br/>Open new temp BoltDB file<br/>Copy live pages only<br/>Atomic rename reclaim fragmented disk space"]
+    Defrag -- No --> End([Done])
+    DefragOp --> End
+```
+
+### Compaction vs Defrag
+
+- **Compaction** removes logical entries from the B-Tree and BoltDB, but BoltDB's free-list still holds the now-empty pages — the **file size does not shrink on disk**.
+- **Defrag** (`Defrag()` in [`backend.go`](server/storage/backend/backend.go)) rewrites the entire BoltDB file to a new file containing only live pages, then atomically replaces the original. This **physically reclaims disk space**.
+
+---
+
+## 12. Authentication & RBAC
+
+When auth is enabled, every gRPC request is intercepted before reaching the MVCC layer. The implementation lives in [`auth/store.go`](server/auth/store.go).
+
+### Auth Request Flow
+
+```
+Client request (with token header)
+    ↓
+gRPC interceptor (v3_server.go)
+    ↓
+AuthStore.IsAdminPermitted() or AuthStore.IsRangePermitted()
+    ↓
+Checks user → role → permission for the specific key range
+    ↓
+Allowed → continue to MVCC
+Denied  → return ErrPermissionDenied
+```
+
+### Token Types
+
+| Type             | Config flag           | Notes                                                                  |
+| ---------------- | --------------------- | ---------------------------------------------------------------------- |
+| **Simple Token** | `--auth-token=simple` | Stateful opaque string, stored in memory; invalidated on leader change |
+| **JWT**          | `--auth-token=jwt`    | Stateless, cryptographically signed; survives leader failovers         |
+
+### RBAC Model
+
+| Entity         | Description                                                       |
+| -------------- | ----------------------------------------------------------------- |
+| **User**       | Has a password (bcrypt hashed) and a set of roles                 |
+| **Role**       | Has a list of `Permission` entries                                |
+| **Permission** | `{PermType: READ/WRITE/READWRITE, Key: string, RangeEnd: string}` |
+
+The `root` user has implicit admin access. The `root` role grants full access to all keys. Auth metadata (users, roles, enabled flag) is persisted in BoltDB under the `auth` bucket, replicated through Raft like all other data.
+
+---
+
+## 13. Cluster Membership & ConfChange
+
+Adding or removing nodes in a distributed system is dangerous because it changes the quorum size. etcd handles this safely via Raft's `ConfChange` mechanism, managed by [`membership/cluster.go`](server/etcdserver/api/membership/cluster.go).
+
+### Membership Change Lifecycle
+
+| Phase              | Description                                                                                                                                                                  |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Add as Learner** | New node is added with `MemberAddAsLearner`. It receives all log entries from the leader but does **not** vote in elections — it cannot affect quorum.                       |
+| **Catch-up**       | The learner replays gigabytes of WAL history without stalling the leader or blocking commits.                                                                                |
+| **Promote**        | Once the learner's `appliedIndex` is within `DefaultSnapshotCatchUpEntries` (5000) of the leader's commit index, it is promoted to a full voting member via `MemberPromote`. |
+| **Remove**         | `MemberRemove` proposes a `ConfChangeRemoveNode` to Raft; once committed, the node is excluded from quorum calculations.                                                     |
+
+### Two-Phase ConfChange (Joint Consensus)
+
+etcd v3.5+ uses **joint consensus** (two `ConfChangeV2` entries) for membership changes:
+
+1. **Phase 1** — Enter the joint configuration (both old and new quorums must agree).
+2. **Phase 2** — Leave the joint configuration (switch to the new configuration).
+
+This prevents the split-brain window that exists in single-phase membership changes.
+
+---
+
+## 14. Corruption Detection
+
+etcd provides a built-in corruption detection mechanism in [`corrupt.go`](server/etcdserver/corrupt.go) to detect and alarm on data divergence between cluster members.
+
+### Detection Modes
+
+| Mode                 | Trigger          | Mechanism                                                              |
+| -------------------- | ---------------- | ---------------------------------------------------------------------- |
+| **InitialCheck**     | On startup       | Hash the entire BoltDB at the current revision; compare with all peers |
+| **PeriodicCheck**    | Every 5 minutes  | Hash a recent revision; compare with a randomly selected peer          |
+| **CompactHashCheck** | After compaction | Compare hashes at compacted revisions across all peers                 |
+
+### Corruption Check Flow
+
+```
+CorruptionChecker.PeriodicCheck()
+    ↓
+mvcc.HashByRev(rev) → CRC32 of all BoltDB key-value pairs at that revision
+    ↓
+PeerHashByRev(rev) → HTTP call to each peer's /members/hash endpoint
+    ↓
+Compare local hash with peer hashes
+    ↓
+Mismatch → TriggerCorruptAlarm(memberID)
+         → etcd enters CORRUPT alarm state
+         → All writes rejected until operator intervenes
+```
+
+The `HashStorage` interface in [`mvcc/hash.go`](server/storage/mvcc/hash.go) computes a CRC32 hash by iterating all BoltDB key-value pairs up to a given revision in sorted order. Any divergence — even a single bit — will be caught.
+
+---
+
+## 15. Fan-Out Learning Strategy
+
+Follow this structured 6-phase approach to master the entire codebase. Each phase builds on the previous.
+
+```mermaid
+graph TD
+    P1["Phase 1 - Request Lifecycle<br/>────────────────<br/>v3_server.go<br/>server.go<br/>apply/uber_applier.go<br/>txn/put.go + range.go"]
+
+    P1 --> P2
+    P1 --> P3
+    P1 --> P4
+
+    P2["Phase 2 - Raft and WAL<br/>────────────────<br/>raft.go Ready loop<br/>storage/wal/wal.go<br/>rafthttp/transport.go<br/>rafthttp/peer.go"]
+
+    P3["Phase 3 - MVCC and Storage<br/>────────────────<br/>mvcc/kvstore.go<br/>mvcc/key_index.go<br/>mvcc/kvstore_txn.go<br/>storage/backend/backend.go<br/>storage/backend/batch_tx.go"]
+
+    P4["Phase 4 - Leases and Watches<br/>────────────────<br/>lease/lessor.go<br/>mvcc/watchable_store.go<br/>mvcc/watcher_group.go<br/>mvcc/watcher.go"]
+
+    P2 --> P5
+    P3 --> P5
+    P4 --> P5
+
+    P5["Phase 5 - Client and CLI<br/>────────────────<br/>api/etcdserverpb/rpc.proto<br/>client/v3/client.go<br/>client/v3/kv.go<br/>client/v3/watch.go<br/>etcdctl/ and etcdutl/"]
+
+    P5 --> P6
+
+    P6["Phase 6 - Operations and Security<br/>────────────────<br/>bootstrap.go<br/>auth/store.go<br/>corrupt.go<br/>api/membership/cluster.go<br/>api/snap/snapshotter.go<br/>api/v3compactor/periodic.go<br/>storage/backend/backend.go Defrag"]
+```
+
+### Phase 1 — Request Lifecycle *(Start Here)*
+
+Trace a single write end-to-end before studying any subsystem in isolation.
+
+- [ ] Read [`v3_server.go`](server/etcdserver/v3_server.go) — how `Put`, `Range`, `Txn`, `LeaseGrant` are received as gRPC calls and proposed to Raft.
+- [ ] Understand `raftRequest()` and `processInternalRaftRequestOnce()` — how proposals are serialized and the goroutine waits for commit.
+- [ ] Read `applyAll()` and `applyEntries()` in [`server.go`](server/etcdserver/server.go) — how committed log entries trigger the apply chain.
+- [ ] Trace [`apply/uber_applier.go`](server/etcdserver/apply/uber_applier.go) — the apply dispatch chain (quota → auth → backend).
+- [ ] Read [`txn/put.go`](server/etcdserver/txn/put.go), [`txn/range.go`](server/etcdserver/txn/range.go), [`txn/txn.go`](server/etcdserver/txn/txn.go) — individual operation handlers.
+
+### Phase 2 — Raft & WAL
+
+- [ ] Study [`raft.go`](server/etcdserver/raft.go) — the `start()` goroutine, `Ready()` consumption, leader vs. follower disk/network ordering (lines 237-320).
+- [ ] Read [`storage/wal/wal.go`](server/storage/wal/wal.go) — `Create()`, `Open()`, `Save()`, `SaveSnap()`, `Release()`.
+- [ ] Inspect [`rafthttp/transport.go`](server/etcdserver/api/rafthttp/transport.go) and [`peer.go`](server/etcdserver/api/rafthttp/peer.go) — how Raft messages are sent over HTTP/2 streams.
+
+### Phase 3 — MVCC & Storage Engine
+
+- [ ] Read [`mvcc/kv.go`](server/storage/mvcc/kv.go) — the `KV`, `WatchableKV`, `TxnWrite` interfaces.
+- [ ] Examine [`mvcc/key_index.go`](server/storage/mvcc/key_index.go) — `keyIndex`, `generation`, tombstones, compaction interactions.
+- [ ] Trace [`mvcc/kvstore.go`](server/storage/mvcc/kvstore.go) and [`kvstore_txn.go`](server/storage/mvcc/kvstore_txn.go) — how `Put`/`Range` translate to BoltDB revision lookups.
+- [ ] Read [`storage/backend/backend.go`](server/storage/backend/backend.go) and [`batch_tx.go`](server/storage/backend/batch_tx.go) — the batch commit loop and `txReadBuffer`.
+
+### Phase 4 — Leases & Watches
+
+- [ ] Study [`lease/lessor.go`](server/lease/lessor.go) — `Grant()`, `Renew()`, `Revoke()`, the expiry heap, `runLoop()`, and lease checkpointing.
+- [ ] Read [`mvcc/watchable_store.go`](server/storage/mvcc/watchable_store.go) — `watch()`, `notify()`, `syncWatchers()`, victim handling.
+- [ ] Study [`mvcc/watcher_group.go`](server/storage/mvcc/watcher_group.go) — the interval tree for range watches and the `watcherGroup` structure.
+
+### Phase 5 — Client Libraries & CLI Tools
+
+- [ ] Read the API contract in [`api/etcdserverpb/rpc.proto`](api/etcdserverpb/rpc.proto) — the canonical definition of all gRPC services.
+- [ ] Study [`client/v3/client.go`](client/v3/client.go) — connection management, retry policy, and credential handling.
+- [ ] Browse [`client/v3/kv.go`](client/v3/kv.go) and [`watch.go`](client/v3/watch.go) — how the SDK implements the `KV` and `Watcher` interfaces on top of gRPC streams.
+- [ ] Explore [`etcdctl/`](etcdctl/) and [`etcdutl/`](etcdutl/) — CLI command handlers and how they use the client SDK.
+
+### Phase 6 — System Operations *(Advanced)*
+
+- [ ] Read [`bootstrap.go`](server/etcdserver/bootstrap.go) — all startup paths: new cluster, WAL recovery, snapshot restore.
+- [ ] Study [`auth/store.go`](server/auth/store.go) — user/role CRUD, RBAC permission checks, JWT vs simple token issuance.
+- [ ] Study [`corrupt.go`](server/etcdserver/corrupt.go) — hash-based corruption detection, peer comparison, alarm triggering.
+- [ ] Read [`api/membership/cluster.go`](server/etcdserver/api/membership/cluster.go) — learner promotion, joint consensus ConfChange.
+- [ ] Read [`api/snap/snapshotter.go`](server/etcdserver/api/snap/snapshotter.go) — how `.snap` files are written and loaded.
+- [ ] Study [`api/v3compactor/periodic.go`](server/etcdserver/api/v3compactor/periodic.go) and [`revision.go`](server/etcdserver/api/v3compactor/revision.go) — auto-compaction modes.
+- [ ] Study `Defrag()` in [`storage/backend/backend.go`](server/storage/backend/backend.go) — physical disk space reclamation.
+
+---
+
+*Last updated to reflect the etcd v3.5+ codebase. All file paths are relative to the repository root.*
