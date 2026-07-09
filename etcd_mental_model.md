@@ -203,6 +203,29 @@ A client can open a streaming gRPC connection to **Watch** a key or a range of k
 - Every time a transaction updates a watched key, the MVCC watchable store (`watchable_store.go`) catches it and sends the revision update down the gRPC stream to the client.
 - The client can also watch from a historical revision (e.g. "Watch for all changes since Revision 10").
 
+### E. Concurrency Boundary: Parallel WAL Write & Network Replication
+To achieve high throughput, `etcd` introduces a critical concurrency optimization during Raft log replication.
+
+* **The Leader Parallelism (Optimistic Replication)**:
+  * When a Raft leader node receives a proposal, it does **not** write to disk and wait before contacting the network.
+  * In the main loop within [raft.go](server/etcdserver/raft.go#L240-L243), the leader broadcasts the replication messages to peer nodes over the network (`r.transport.Send(...)`) **in parallel** with committing entries to its own local disk WAL journal (`r.storage.Save(...)`).
+  * By overlapping network round-trip time with local disk I/O latency, the overall block commitment path is significantly shortened.
+* **The Follower Safety Boundary**:
+  * Unlike the leader, followers cannot process network propagation and disk writing in parallel.
+  * Followers must write and sync (`fsync`) entries to their WAL disk logs ([raft.go](server/etcdserver/raft.go#L297-L302)) **before** replying back to the leader. This strict serialization prevents data loss or split-brain states in the event of a crash-recovery cycle.
+
+### F. BoltDB Batching & Buffer Commit Mechanics
+Writing directly to BoltDB disk pages on every key-value request would degrade performance due to the overhead of BoltDB's B+tree index restructuring and disk syncing (`fsync`).
+
+* **Batched Transactions (`batchTxBuffered`)**:
+  * Instead of committing to the DB page file on every client write, the backend wrapper accumulates changes inside an in-memory buffer (`txReadBuffer`).
+  * These accumulated writes are periodically committed to BoltDB as a single batch, triggered either when:
+    1. The time interval configured passes (`batchInterval`, default `100ms`).
+    2. The number of buffered mutations hits the threshold (`batchLimit`, default `10,000` operations).
+* **Consistent Concurrent Reads**:
+  * Reads do not wait for the flush cycle. If a reader only searched the on-disk BoltDB tables, it would fail to read recently updated values that are still buffered in memory.
+  * To solve this, `ConcurrentReadTx` reads from BoltDB *and* queries the active in-memory `txReadBuffer` ([backend.go](server/storage/backend/backend.go#L115-L120)). Values present in the buffer are merged with disk-read data, ensuring read linearizability without blocking write paths.
+
 ---
 
 ## 5. Structured Fan-Out Learning Strategy
